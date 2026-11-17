@@ -6,7 +6,7 @@
 
 原先设计员在Excel里堆叠委托号、客户、检测项、方法与结果，再手工画表结构。痛点：依赖口径难确认、复合键容易漏判、拆表后无法证明无损。上游为委托单和已确认业务规则，本项目承接关系草案登记、函数依赖编辑、3NF合成、验证报告导出，下游为实验数据录入系统的数据库设计人员。
 
-核心实体：关系草案 Relation、函数依赖 Dependency、分解报告 Report。4业务页和独立登录页；管理员另有审计页。业务规则不执行为SQL，属性名是纯数据。
+核心实体：关系草案 Relation、函数依赖 Dependency、分解报告 Report。5业务页（含备份恢复）和独立登录页；管理员另有审计页。业务规则不执行为SQL，属性名是纯数据。
 
 ## 快速启动
 
@@ -44,19 +44,31 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 
 这是小型关系模型设计辅助工具，FD由人工提供，不能从脏数据自动推断业务规则；不连接生产数据或自动执行DDL。精确投影在10属性内有界，仍可能随依赖复杂度增加耗时。单worker串行队列，不带生产任务重试/崩溃续跑。
 
+## 整册备份与恢复
+
+跨部署迁移以备份包（`.swb`，gzip tar）为单位：`manifest.json`（格式/计数/逐文件SHA256/HMAC签名）+ `relations.json` + `dependencies.json` + `reports.json` + `files/report-*.json` 报告原始文件。签名密钥为 `JWT_SECRET`，跨部署恢复要求两端使用同一密钥。
+
+- **备份**：`GET /backups/export` 在单个数据库事务的一致性快照（MySQL REPEATABLE READ）中打包同一时点的全部草案、依赖与`completed`报告；快照读不阻塞写入，备份期间可继续改草案、跑分解，queued/running的进行中任务不混入。报告文件缺失时按库内`result`确定性重建。
+- **恢复**：`POST /backups/restore` 上传后建任务（待校验→校验中→恢复中→已恢复/失败），Redis队列交给worker串行执行。同一包按SHA256去重，重复上传、重试、并发恢复都不会重复新增。
+- **校验**：签名、逐文件SHA256、缺件/多余文件、结构约束（属性1–10、依赖≤64、引用完整）全部通过才进入恢复；损坏、缺件或篡改的包整包拒绝，库中不留任何残留。
+- **落库**：单事务插入，包内按草案编号重建引用（id重映射），报告保留原始快照、结果与`created_at`，报告文件在事务提交前写入、提交即全部就绪；提交失败回滚并清理已写文件，不留半册。目标已有同编号草案保持原样，其依赖与报告整组跳过并计入任务统计。
+- **续跑**：worker启动时重投卡在校验中/恢复中的任务；恢复统计与数据同事务提交，重跑自动跳过已恢复内容，崩溃留下的孤儿报告文件在下次恢复时清理。
+
+页面「备份恢复」（导航V）提供下载、上传、任务列表与失败重试；观察员可下载备份包与查看任务，上传/重试限operator/admin。测试：`python3 backend/tests/test_backup_restore.py` 与 `python3 backend/tests/test_backup_api.py`（需httpx），覆盖备份中改依赖快照、编号冲突、写文件后落库失败回滚、损坏/缺件/篡改拒绝、幂等重试与中断续跑。
+
 ## 工程结构
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页、登录、共享业务表格与报告组件|
-|backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照与导出|
-|worker|Python3.11|闭包、候选键、3NF与chase|
-|db|MySQL8.0|JSON属性与依赖、任务报告|
-|redis|Redis7|持久任务队列|
+|frontend|原生HTML/CSS/JS + Nginx|5业务页、登录、共享业务表格与报告组件|
+|backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照、导出与整册备份恢复|
+|worker|Python3.11|闭包、候选键、3NF与chase；恢复任务执行|
+|db|MySQL8.0|JSON属性与依赖、任务报告、恢复任务|
+|redis|Redis7|持久任务队列（分解与恢复）|
 
-目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
+目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`；`backend/tests/`（备份恢复单元与API测试）。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
 
-枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
+枚举：角色admin/operator/viewer、任务queued/running/completed/failed、恢复pending/verifying/restoring/restored/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
 
 环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化，无在线迁移引擎。
 

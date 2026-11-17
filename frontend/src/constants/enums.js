@@ -1,2 +1,2 @@
 export const ROLES={admin:'管理员',operator:'操作员',viewer:'观察员'};
-export const RUN_STATES={queued:'排队中',running:'执行中',completed:'已完成',failed:'失败'};
+export const RUN_STATES={queued:'排队中',running:'执行中',completed:'已完成',failed:'失败',pending:'待校验',verifying:'校验中',restoring:'恢复中',restored:'已恢复'};
